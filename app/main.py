@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,12 +9,13 @@ from app.config import Settings, get_settings
 from app.errors import install_error_handlers
 from app.migrate import migrate_until_done
 from app.reaper import run_reaper
-from app.routes import auth, health, reservations, shows
+from app.observability import ObservabilityMiddleware, configure_logging
+from app.routes import auth, health, metrics, reservations, shows
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -45,6 +45,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(shows.router)
     app.include_router(reservations.router)
+    app.include_router(metrics.router)
+    # Outermost: every response (including error handlers' 4xx/5xx) gets a
+    # request id, an access log line and RED metrics.
+    app.add_middleware(ObservabilityMiddleware, fastapi_app=app)
     return app
 
 

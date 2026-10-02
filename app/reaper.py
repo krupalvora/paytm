@@ -20,12 +20,13 @@ async def run_reaper(pool: asyncpg.Pool, migrated: asyncio.Event, interval_s: fl
     await migrated.wait()
     while True:
         try:
-            expired = 0
+            expired = seats = 0
             async with pool.acquire() as conn:
-                while expired < batch and await expire_one(conn):
+                while expired < batch and (n := await expire_one(conn)):
                     expired += 1
+                    seats += n
             if expired:
-                log.info("expired holds", extra={"count": expired})
+                log.info("expired holds", extra={"reservations": expired, "seats": seats})
             if expired >= batch:
                 continue  # backlog: go again without sleeping
         except asyncio.CancelledError:

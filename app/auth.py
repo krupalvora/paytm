@@ -6,6 +6,7 @@ import jwt
 from fastapi import Request
 
 from app.errors import AppError
+from app.observability import user_id_var
 
 USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.@-]{1,64}$")
 _ALGO = "HS256"
@@ -46,4 +47,5 @@ async def current_user(request: Request) -> str:
     sub = claims["sub"]
     if not isinstance(sub, str) or not USER_ID_PATTERN.match(sub):
         raise AppError(401, "unauthorized", "invalid subject")
+    user_id_var.set(sub)  # tags every log line of this request
     return sub

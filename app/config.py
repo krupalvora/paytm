@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     reaper_interval_s: float = 1.0
     reaper_batch: int = 200
 
+    # /metrics reads per-show seat gauges from the DB for this many recent shows.
+    metrics_recent_shows: int = 20
+    metrics_db_timeout_s: float = 2.0
+
     log_level: str = "INFO"
     port: int = 8000
 

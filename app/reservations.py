@@ -22,6 +22,7 @@ from datetime import timedelta
 import asyncpg
 
 from app.errors import AppError
+from app.observability import RESERVATIONS_RELEASED, SEATS_RELEASED
 from app.schemas import ReservationView, ReserveRequest
 
 
@@ -261,21 +262,23 @@ async def get_reservation(conn: asyncpg.Connection, reservation_id: uuid.UUID, u
     return to_view(row)
 
 
-async def cancel(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> ReservationView:
-    """Owner-only. Idempotent: cancelling an already-released reservation is a no-op."""
+async def cancel(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> tuple[ReservationView, bool]:
+    """Owner-only. Idempotent: cancelling an already-released reservation is a
+    no-op. Returns (reservation, whether this call released it)."""
     async with conn.transaction():
         res = await _lock_owned(conn, reservation_id, user_id)
         if res["status"] not in LIVE:
-            return to_view(res)
-        return to_view(await _release(conn, res, "cancelled"))
+            return to_view(res), False
+        return to_view(await _release(conn, res, "cancelled")), True
 
 
-async def confirm(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> ReservationView:
-    """Owner-only. held -> confirmed, only while the hold is unexpired."""
+async def confirm(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> tuple[ReservationView, bool]:
+    """Owner-only. held -> confirmed, only while the hold is unexpired.
+    Returns (reservation, whether this call confirmed it)."""
     async with conn.transaction():
         res = await _lock_owned(conn, reservation_id, user_id)
         if res["status"] == "confirmed":
-            return to_view(res)
+            return to_view(res), False
         if res["status"] != "held":
             raise AppError(
                 409, "reservation_not_active", f"reservation is {res['status']}", reservation_status=res["status"]
@@ -290,8 +293,10 @@ async def confirm(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: 
         else:
             row = await _confirm_held(conn, res)
     if expired:
+        RESERVATIONS_RELEASED.labels("expired").inc()
+        SEATS_RELEASED.labels("expired").inc(len(res["seats"]))
         raise AppError(409, "hold_expired", "hold expired before confirmation; seats released")
-    return to_view(row)
+    return to_view(row), True
 
 
 async def _confirm_held(conn: asyncpg.Connection, res: asyncpg.Record) -> asyncpg.Record:
@@ -312,7 +317,7 @@ async def _confirm_held(conn: asyncpg.Connection, res: asyncpg.Record) -> asyncp
     )
 
 
-async def expire_one(conn: asyncpg.Connection) -> bool:
+async def expire_one(conn: asyncpg.Connection) -> int:
     """Expire the oldest due hold. SKIP LOCKED: safe with many reaper instances
     and never blocks behind a cancel/confirm working on the same row."""
     async with conn.transaction():
@@ -324,6 +329,8 @@ async def expire_one(conn: asyncpg.Connection) -> bool:
                 FOR UPDATE SKIP LOCKED"""
         )
         if res is None:
-            return False
+            return 0
         await _release(conn, res, "expired")
-        return True
+    RESERVATIONS_RELEASED.labels("expired").inc()
+    SEATS_RELEASED.labels("expired").inc(len(res["seats"]))
+    return len(res["seats"])
