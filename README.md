@@ -10,15 +10,18 @@ Design rationale: [WRITEUP.md](WRITEUP.md).
 
 | | URL |
 |---|---|
-| API | `https://<HOST>` *(fill in after deploy)* |
-| Health | `https://<HOST>/healthz`, `https://<HOST>/readyz` |
-| Metrics | `https://<HOST>/metrics` |
-| Dashboard | `https://<HOST>/grafana/` (anonymous, read-only) |
-| Alert rules | `https://<HOST>/prometheus/alerts` |
-| Live logs | `https://<HOST>/logs/` (basic auth, credentials shared separately) |
+| API | https://13-126-126-106.sslip.io |
+| Health | https://13-126-126-106.sslip.io/healthz, https://13-126-126-106.sslip.io/readyz |
+| Metrics | https://13-126-126-106.sslip.io/metrics |
+| Dashboard | https://13-126-126-106.sslip.io/grafana/ (anonymous, read-only) |
+| Alert rules | https://13-126-126-106.sslip.io/prometheus/alerts |
+| Live logs | https://13-126-126-106.sslip.io/logs/ (basic auth, credentials shared separately) |
+
+Hosted on a single AWS EC2 VM (ap-south-1) via [docker-compose.prod.yml](docker-compose.prod.yml).
+The admin token is shared separately; user tokens come from `POST /auth/token`.
 
 ```bash
-./burst.sh https://<HOST> --admin-token <ADMIN_TOKEN>
+./burst.sh https://13-126-126-106.sslip.io --admin-token <ADMIN_TOKEN>
 ```
 
 ## Try it
