@@ -21,6 +21,35 @@ uv venv --python 3.12 .venv && uv pip install -r requirements-dev.txt
 .venv/bin/pytest -q
 ```
 
+## Burst test (one command)
+
+```bash
+./burst.sh <BASE_URL> --admin-token <ADMIN_TOKEN>     # or: make burst URL=<BASE_URL> ADMIN_TOKEN=<...>
+./burst.sh http://localhost:8000 --quick              # small local smoke run
+```
+
+Needs `uv` (deps come from the script header), or Docker, or `python3` with `httpx`.
+It creates a fresh show (2000 seats, limit 4), mints user tokens, then fires ~20,000
+reserve requests at once (concurrency 500), mixing:
+
+- **hot-seat**: 500 distinct users storm each of 5 seats, so expect exactly one 201 per seat
+- **limit**: 50 users each fire 10 parallel single-seat reserves, so at most 4 each
+- **idempotent**: 100 users each send one key 20× in parallel, so one reservation per key
+- **hold**: 100 users hold a seat, then half confirm and half cancel
+- **general**: random users and seats, 10% sent twice with the same key
+
+While it runs, it polls `GET /shows/{id}` to check `available + held + confirmed == total`. Then it
+probes same-key-different-body (expects 409) and identity spoofing (body `user_id` must be ignored,
+another user's cancel must get 404), and prints:
+
+- HTTP status, outcome and per-scenario distributions (confirmed / declined by reason / 5xx), latency percentiles
+- `/metrics` deltas next to what the client observed
+- PASS/FAIL for each correctness rule, including the final seat map exactly matching the set of
+  successful responses and the metrics gauges matching the API
+
+Exit code is non-zero if any check fails; a JSON summary goes to `burst-results/`.
+Tune with `--requests`, `--concurrency`, `--hot-users`, ... (`./burst.sh x --help`).
+
 ## API
 
 Admin endpoints use `Authorization: Bearer $ADMIN_TOKEN` (default `dev-admin-token` locally).

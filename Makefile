@@ -1,4 +1,4 @@
-.PHONY: up down logs dev test fmt
+.PHONY: up down logs dev db test burst
 
 up:            ## build and run app + postgres
 	docker compose up --build -d
@@ -18,3 +18,7 @@ db:
 
 test:
 	pytest -q
+
+URL ?= http://localhost:8000
+burst:         ## on-sale stampede: make burst URL=https://... ADMIN_TOKEN=...
+	./burst.sh $(URL) $(ARGS)
