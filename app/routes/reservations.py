@@ -14,6 +14,10 @@ router = APIRouter(tags=["reservations"])
 _TRANSIENT = (asyncpg.DeadlockDetectedError, asyncpg.SerializationError)
 
 
+def _conn(request: Request):
+    return request.app.state.pool.acquire(timeout=request.app.state.settings.db_acquire_timeout_s)
+
+
 def _idempotency_key(request: Request, body: ReserveRequest) -> str:
     header = request.headers.get("idempotency-key")
     if header is not None and body.idempotency_key is not None and header != body.idempotency_key:
@@ -34,7 +38,7 @@ async def reserve(
     key = _idempotency_key(request, body)
     settings = request.app.state.settings
 
-    async with request.app.state.pool.acquire(timeout=settings.db_acquire_timeout_s) as conn:
+    async with _conn(request) as conn:
         show = await conn.fetchrow("SELECT * FROM shows WHERE id = $1", sid)
         if show is None:
             raise AppError(404, "show_not_found", "show not found")
@@ -57,3 +61,26 @@ async def reserve(
             headers={"Idempotent-Replayed": "true"},
         )
     return JSONResponse(status_code=201, content=outcome.reservation.model_dump())
+
+
+@router.get("/reservations/{reservation_id}")
+async def get_reservation(reservation_id: str, request: Request, user_id: str = Depends(current_user)) -> dict:
+    rid = reservations.parse_reservation_id(reservation_id)
+    async with _conn(request) as conn:
+        return (await reservations.get_reservation(conn, rid, user_id)).model_dump()
+
+
+@router.post("/reservations/{reservation_id}/cancel")
+async def cancel(reservation_id: str, request: Request, user_id: str = Depends(current_user)) -> dict:
+    """Owner-only; idempotent. Releases held or confirmed seats back to available."""
+    rid = reservations.parse_reservation_id(reservation_id)
+    async with _conn(request) as conn:
+        return (await reservations.cancel(conn, rid, user_id)).model_dump()
+
+
+@router.post("/reservations/{reservation_id}/confirm")
+async def confirm(reservation_id: str, request: Request, user_id: str = Depends(current_user)) -> dict:
+    """Owner-only; idempotent. Turns an unexpired hold into a confirmed booking."""
+    rid = reservations.parse_reservation_id(reservation_id)
+    async with _conn(request) as conn:
+        return (await reservations.confirm(conn, rid, user_id)).model_dump()

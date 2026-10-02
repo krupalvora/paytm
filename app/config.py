@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     # Retries for transient DB conflicts (deadlock / serialization) before giving up.
     reserve_max_attempts: int = 3
 
+    # Hold expiry sweeper (every instance runs one; they cooperate via SKIP LOCKED).
+    reaper_enabled: bool = True
+    reaper_interval_s: float = 1.0
+    reaper_batch: int = 200
+
     log_level: str = "INFO"
     port: int = 8000
 

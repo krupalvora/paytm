@@ -189,3 +189,141 @@ async def reserve(
         raise AppError(409, "idempotency_conflict", "concurrent request with same key; retry") from None
 
     return ReserveOutcome(reservation=to_view(row), replayed=False)
+
+
+# --------------------------------------------------------------------------
+# Lifecycle: release (cancel / expire) and confirm.
+#
+# Same global lock order as reserve: reservation row -> user counter -> seats
+# (label order). Seat updates are guarded on reservation_id, so releasing
+# reservation R can only ever touch seats R still owns -- it can never
+# resurrect a seat that has since been confirmed to someone else.
+# --------------------------------------------------------------------------
+
+LIVE = ("held", "confirmed")
+
+
+def parse_reservation_id(raw: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(raw)
+    except ValueError:
+        raise AppError(404, "reservation_not_found", "reservation not found") from None
+
+
+async def _lock_owned(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> asyncpg.Record:
+    row = await conn.fetchrow("SELECT * FROM reservations WHERE id = $1 FOR UPDATE", reservation_id)
+    # Not-yours is indistinguishable from not-found: don't confirm existence
+    # of other users' reservations.
+    if row is None or row["user_id"] != user_id:
+        raise AppError(404, "reservation_not_found", "reservation not found")
+    return row
+
+
+async def _release(conn: asyncpg.Connection, res: asyncpg.Record, to_status: str) -> asyncpg.Record:
+    """Return a live reservation's seats to available. Caller holds the row lock."""
+    assert to_status in ("cancelled", "expired") and res["status"] in LIVE
+    n = len(res["seats"])
+    await conn.execute(
+        "UPDATE user_show_seats SET seats_held = seats_held - $3 WHERE show_id = $1 AND user_id = $2",
+        res["show_id"], res["user_id"], n,
+    )
+    released = await conn.fetchval(
+        """WITH target AS (
+               SELECT label FROM seats
+                WHERE show_id = $1 AND label = ANY($2::text[]) AND reservation_id = $3
+                ORDER BY label
+                FOR UPDATE)
+           , upd AS (
+               UPDATE seats s
+                  SET status = 'available', reservation_id = NULL, user_id = NULL,
+                      hold_expires_at = NULL, updated_at = now()
+                 FROM target
+                WHERE s.show_id = $1 AND s.label = target.label AND s.reservation_id = $3
+            RETURNING 1)
+           SELECT count(*) FROM upd""",
+        res["show_id"], res["seats"], res["id"],
+    )
+    if released != n:
+        # A live reservation must own all its seats; anything else is a bug.
+        # Roll back rather than let the counter drift.
+        raise RuntimeError(f"reservation {res['id']} owned {released}/{n} seats")
+    return await conn.fetchrow(
+        """UPDATE reservations SET status = $2, hold_expires_at = NULL, updated_at = now()
+            WHERE id = $1 RETURNING *""",
+        res["id"], to_status,
+    )
+
+
+async def get_reservation(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> ReservationView:
+    row = await conn.fetchrow("SELECT * FROM reservations WHERE id = $1", reservation_id)
+    if row is None or row["user_id"] != user_id:
+        raise AppError(404, "reservation_not_found", "reservation not found")
+    return to_view(row)
+
+
+async def cancel(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> ReservationView:
+    """Owner-only. Idempotent: cancelling an already-released reservation is a no-op."""
+    async with conn.transaction():
+        res = await _lock_owned(conn, reservation_id, user_id)
+        if res["status"] not in LIVE:
+            return to_view(res)
+        return to_view(await _release(conn, res, "cancelled"))
+
+
+async def confirm(conn: asyncpg.Connection, reservation_id: uuid.UUID, user_id: str) -> ReservationView:
+    """Owner-only. held -> confirmed, only while the hold is unexpired."""
+    async with conn.transaction():
+        res = await _lock_owned(conn, reservation_id, user_id)
+        if res["status"] == "confirmed":
+            return to_view(res)
+        if res["status"] != "held":
+            raise AppError(
+                409, "reservation_not_active", f"reservation is {res['status']}", reservation_status=res["status"]
+            )
+
+        expired = await conn.fetchval("SELECT $1::timestamptz <= now()", res["hold_expires_at"])
+        if expired:
+            # Expire inline rather than wait for the reaper so the seat is
+            # re-bookable immediately. Raised after commit (below), otherwise
+            # the transaction would roll the release back.
+            await _release(conn, res, "expired")
+        else:
+            row = await _confirm_held(conn, res)
+    if expired:
+        raise AppError(409, "hold_expired", "hold expired before confirmation; seats released")
+    return to_view(row)
+
+
+async def _confirm_held(conn: asyncpg.Connection, res: asyncpg.Record) -> asyncpg.Record:
+    reservation_id = res["id"]
+    # Only R's lock holders (cancel/confirm/expire) ever touch R's seats, and
+    # we hold R's lock, so no seat-order locking is needed here.
+    n = await conn.execute(
+        """UPDATE seats SET status = 'confirmed', hold_expires_at = NULL, updated_at = now()
+            WHERE reservation_id = $1 AND status = 'held'""",
+        reservation_id,
+    )
+    if n != f"UPDATE {len(res['seats'])}":
+        raise RuntimeError(f"reservation {reservation_id} confirm touched {n}")
+    return await conn.fetchrow(
+        """UPDATE reservations SET status = 'confirmed', hold_expires_at = NULL, updated_at = now()
+            WHERE id = $1 RETURNING *""",
+        reservation_id,
+    )
+
+
+async def expire_one(conn: asyncpg.Connection) -> bool:
+    """Expire the oldest due hold. SKIP LOCKED: safe with many reaper instances
+    and never blocks behind a cancel/confirm working on the same row."""
+    async with conn.transaction():
+        res = await conn.fetchrow(
+            """SELECT * FROM reservations
+                WHERE status = 'held' AND hold_expires_at <= now()
+                ORDER BY hold_expires_at
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED"""
+        )
+        if res is None:
+            return False
+        await _release(conn, res, "expired")
+        return True

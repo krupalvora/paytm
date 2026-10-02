@@ -16,6 +16,7 @@ async def app():
         database_url=os.environ.get("TEST_DATABASE_URL", "postgresql://seats:seats@localhost:5432/seats"),
         admin_token="test-admin",
         db_pool_max=30,
+        reaper_interval_s=0.2,
     )
     app = create_app(settings)
     async with app.router.lifespan_context(app):
