@@ -6,6 +6,18 @@ from app import db
 router = APIRouter(tags=["health"])
 
 
+@router.get("/", include_in_schema=False)
+async def index() -> dict:
+    # Landing page for the bare URL, so it points somewhere useful instead of 404.
+    return {
+        "service": "seat-reservation",
+        "docs": "/docs",
+        "health": {"liveness": "/healthz", "readiness": "/readyz"},
+        "metrics": "/metrics",
+        "dashboard": "/grafana/",
+    }
+
+
 @router.get("/healthz")
 async def liveness() -> dict:
     # Liveness: the process is up and serving. Deliberately does NOT touch the

@@ -139,3 +139,9 @@ async def test_db_outage_is_503_not_500(client, make_show, auth_for, monkeypatch
     assert r.json()["error"]["code"] == "database_unavailable"
     assert r.headers["retry-after"] == "2"
     assert (await client.get("/readyz")).status_code == 503
+
+
+async def test_root_points_at_docs(client):
+    r = await client.get("/")
+    assert r.status_code == 200
+    assert r.json()["docs"] == "/docs"

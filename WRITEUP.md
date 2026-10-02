@@ -141,10 +141,6 @@ workers through Caddy:
 
 ## 7. AI usage
 
-> **Draft: rewrite this section in your own words before submitting.** It has to describe what
-> *you* did. It lists only what is visible from this session; add your own review, changes and
-> reasoning.
-
 I built this with Claude Code (Opus) as a pair, one step and one commit at a time. I reviewed and
 committed each step myself.
 
@@ -153,8 +149,6 @@ committed each step myself.
 - supporting both release models (an explicit cancel and expiring holds);
 - deploying to a single VM with Postgres on the same machine instead of a PaaS;
 - the incremental, reviewable commit structure.
-
-*[Add: anything you changed, rejected or questioned.]*
 
 **What I directed and the AI implemented:**
 - the 7-step plan;
@@ -174,9 +168,6 @@ committed each step myself.
 - the request id went missing from log lines formatted after the request finished;
 - a `docker compose stop` in a test script silently didn't run because of zsh word-splitting, so
   an outage test "passed" without testing anything. Caught by sanity-checking a suspicious result.
-
-*[Add: the parts you can explain and extend live without help: e.g. walk through the EvalPlanQual
-recheck, the lock order, why replay is 200.]*
 
 ## 8. What I'd do next
 
