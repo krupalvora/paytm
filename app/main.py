@@ -9,7 +9,7 @@ from app import db
 from app.config import Settings, get_settings
 from app.errors import install_error_handlers
 from app.migrate import migrate_until_done
-from app.routes import health, shows
+from app.routes import auth, health, reservations, shows
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -35,7 +35,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Seat Reservation Service", version="0.1.0", lifespan=lifespan)
     install_error_handlers(app)
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(shows.router)
+    app.include_router(reservations.router)
     return app
 
 

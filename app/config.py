@@ -16,9 +16,17 @@ class Settings(BaseSettings):
     # Bearer token for admin endpoints (POST /shows). Override in every real deploy.
     admin_token: str = "dev-admin-token"
 
+    # HS256 secret for user tokens. Override in every real deploy.
+    jwt_secret: str = "dev-jwt-secret-change-me-0123456789"
+    token_ttl_s: int = 24 * 3600
+    allow_token_issue: bool = True
+
     default_per_user_limit: int = 4
     default_hold_ttl_seconds: int = 300
     max_seats_per_show: int = 20000
+    max_seats_per_request: int = 10
+    # Retries for transient DB conflicts (deadlock / serialization) before giving up.
+    reserve_max_attempts: int = 3
 
     log_level: str = "INFO"
     port: int = 8000

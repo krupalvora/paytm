@@ -54,3 +54,36 @@ class ShowView(BaseModel):
     created_at: str
     counts: SeatCounts
     seats: list[SeatView]
+
+
+IDEMPOTENCY_KEY_PATTERN = r"^[A-Za-z0-9_.:-]{1,128}$"
+
+
+class ReserveRequest(BaseModel):
+    # Unknown fields (e.g. a spoofed "user_id") are ignored: identity is the token's.
+    seats: list[str] = Field(min_length=1, max_length=10)
+    idempotency_key: str | None = Field(default=None, pattern=IDEMPOTENCY_KEY_PATTERN)
+    # false: confirm immediately. true: time-boxed hold that must be confirmed
+    # before hold_ttl_seconds or it expires back to available.
+    hold: bool = False
+
+    model_config = {"strict": True, "extra": "ignore"}
+
+    @field_validator("seats")
+    @classmethod
+    def _seats(cls, v: list[str]) -> list[str]:
+        return _no_duplicates(v)
+
+
+ReservationStatus = Literal["held", "confirmed", "cancelled", "expired"]
+
+
+class ReservationView(BaseModel):
+    reservation_id: str
+    show_id: str
+    user_id: str
+    seats: list[str]
+    amount_paise: int
+    status: ReservationStatus
+    hold_expires_at: str | None = None
+    created_at: str
