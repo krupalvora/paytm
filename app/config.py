@@ -1,0 +1,22 @@
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    database_url: str = "postgresql://seats:seats@localhost:5432/seats"
+    db_pool_max: int = 20
+    # How long a request may wait for a pooled connection before we give up.
+    db_acquire_timeout_s: float = 30.0
+    # Readiness probe must answer fast; a slow DB counts as not ready.
+    readiness_timeout_s: float = 2.0
+
+    log_level: str = "INFO"
+    port: int = 8000
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
