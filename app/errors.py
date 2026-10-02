@@ -4,8 +4,10 @@ Domain declines (seat taken, over limit, ...) are AppErrors with 4xx codes.
 Anything else is a bug and becomes a logged 500.
 """
 
+import asyncio
 import logging
 
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -43,6 +45,26 @@ def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(StarletteHTTPException)
     async def _http(_: Request, exc: StarletteHTTPException):
         return JSONResponse(status_code=exc.status_code, content=_body("http_error", str(exc.detail)))
+
+    # Dependency failures: honest 503 + Retry-After rather than an opaque 500.
+    # Readiness is failing at the same time, so the LB stops sending traffic.
+    async def _db_unavailable(_: Request, exc: Exception):
+        log.warning("database unavailable: %s: %s", type(exc).__name__, exc)
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": "2"},
+            content=_body("database_unavailable", "database temporarily unavailable; retry"),
+        )
+
+    for exc_type in (
+        OSError,  # DNS / connection refused / reset
+        asyncpg.PostgresConnectionError,
+        asyncpg.CannotConnectNowError,
+        asyncpg.InterfaceError,
+        asyncpg.TooManyConnectionsError,
+        asyncio.TimeoutError,  # pool acquire timed out
+    ):
+        app.add_exception_handler(exc_type, _db_unavailable)
 
     @app.exception_handler(Exception)
     async def _unhandled(_: Request, exc: Exception):

@@ -1,0 +1,67 @@
+# What pages at 2am. No Alertmanager is wired up in this demo; the rules are
+# evaluated and visible (firing / pending) at /prometheus/alerts.
+groups:
+  - name: seats-correctness
+    rules:
+      - alert: SeatInvariantViolated
+        # A taken seat without a matching live reservation, or a per-user
+        # counter that disagrees with seats held. Means a double-sell or a
+        # limit bypass is possible. Page immediately.
+        expr: sum(seat_invariant_violations) > 0
+        labels: { severity: page }
+        annotations:
+          summary: "Seat/reservation/counter invariant violated ({{ $value }} rows)"
+
+      - alert: Reservation5xx
+        # Declines are 4xx by design; any 5xx on the reserve path is a bug or
+        # an infrastructure failure.
+        expr: sum(increase(http_requests_total{status=~"5.."}[2m])) > 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "{{ $value }} 5xx responses in the last 2m"
+
+      - alert: HoldsNotExpiring
+        # Held seats past expiry by >30s: the reaper is stuck, inventory is
+        # silently locked away from buyers.
+        expr: max(seat_invariant_violations{check="holds_overdue_for_expiry"}) > 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Expired holds are not being released"
+
+      - alert: ReserveContentionDeclines
+        # Transient DB conflicts exhausted retries. Shouldn't happen with
+        # ordered locking; if it does, lock ordering regressed.
+        expr: sum(rate(reservations_declined_total{reason="contention"}[5m])) > 0
+        for: 2m
+        labels: { severity: ticket }
+
+  - name: seats-availability
+    rules:
+      - alert: ServiceDown
+        expr: up{job="seats"} == 0
+        for: 1m
+        labels: { severity: page }
+
+      - alert: DatabaseUnreachableFromMetrics
+        expr: max(seat_metrics_db_scrape_ok) == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "App cannot query Postgres (readiness should be failing too)"
+
+      - alert: ReserveLatencyHigh
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{route="/shows/{show_id}/reserve"}[5m]))) > 2
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Reserve p99 above 2s for 5m"
+
+      - alert: DbPoolSaturated
+        expr: |
+          (sum(db_pool_connections{state="size"}) - sum(db_pool_connections{state="idle"}))
+            / sum(db_pool_connections{state="max"}) > 0.9
+        for: 5m
+        labels: { severity: ticket }

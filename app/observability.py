@@ -3,18 +3,21 @@
 import contextvars
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
 
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import REGISTRY, CollectorRegistry, Counter, Gauge, Histogram, generate_latest, multiprocess
+from prometheus_client.core import GaugeMetricFamily
 from starlette.routing import Match
 
 request_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 user_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("user_id", default=None)
 
 # --------------------------------------------------------------------------- metrics
-# Counters are per process and reset on restart (use rate()/increase()).
+# Counters are summed across worker processes (multiprocess mode) and reset
+# on restart (use rate()/increase()).
 # Seat gauges are read from the DB at scrape time, so they always reconcile
 # with GET /shows/{id}.
 
@@ -33,15 +36,9 @@ RESERVATIONS_RELEASED = Counter(
 )
 SEATS_RELEASED = Counter("seats_released_total", "Seats released back to available", ["reason"])
 
-SEATS = Gauge("seats", "Seats per status for recently created shows (read from DB at scrape)", ["show_id", "status"])
-SEATS_AVAILABLE = Gauge("seats_available", "Available seats per recent show (read from DB at scrape)", ["show_id"])
-INVARIANT_VIOLATIONS = Gauge(
-    "seat_invariant_violations",
-    "Cross-table consistency violations across recent shows (must be 0)",
-    ["check"],
-)
-DB_SCRAPE_OK = Gauge("seat_metrics_db_scrape_ok", "1 if the DB-backed gauges were refreshed on this scrape")
-DB_POOL = Gauge("db_pool_connections", "asyncpg pool connections", ["state"])
+# Summed across worker processes in multiprocess mode.
+DB_POOL = Gauge("db_pool_connections", "asyncpg pool connections across workers", ["state"],
+                multiprocess_mode="livesum")
 
 HTTP_REQUESTS = Counter("http_requests_total", "HTTP requests", ["method", "route", "status"])
 HTTP_LATENCY = Histogram(
@@ -63,59 +60,101 @@ DECLINE_REASONS = {
 }
 
 
-async def refresh_db_gauges(pool, recent_shows: int, timeout_s: float) -> None:
-    """Recompute seat gauges for the N most recent shows straight from the DB."""
-    try:
-        async with pool.acquire(timeout=timeout_s) as conn:
-            rows = await conn.fetch(
-                """WITH recent AS (SELECT id FROM shows ORDER BY created_at DESC LIMIT $1)
-                   SELECT s.show_id, s.status, count(*) AS n
-                     FROM seats s JOIN recent r ON r.id = s.show_id
-                    GROUP BY s.show_id, s.status""",
-                recent_shows,
-                timeout=timeout_s,
-            )
-            violations = await conn.fetchrow(
-                """WITH recent AS (SELECT id FROM shows ORDER BY created_at DESC LIMIT $1)
-                   SELECT
-                     (SELECT count(*) FROM seats s JOIN recent ON recent.id = s.show_id
-                        LEFT JOIN reservations r ON r.id = s.reservation_id
-                       WHERE s.status <> 'available'
-                         AND (r.id IS NULL OR r.status <> s.status OR r.user_id <> s.user_id))
-                       AS seat_without_live_reservation,
-                     (SELECT count(*) FROM user_show_seats u JOIN recent ON recent.id = u.show_id
-                       WHERE u.seats_held <> (SELECT count(*) FROM seats s
-                                               WHERE s.show_id = u.show_id AND s.user_id = u.user_id
-                                                 AND s.status <> 'available'))
-                       AS user_counter_drift,
-                     (SELECT count(*) FROM reservations r JOIN recent ON recent.id = r.show_id
-                       WHERE r.status = 'held' AND r.hold_expires_at < now() - interval '30 seconds')
-                       AS holds_overdue_for_expiry""",
-                recent_shows,
-                timeout=timeout_s,
-            )
-    except Exception:
-        DB_SCRAPE_OK.set(0)
-        logging.getLogger(__name__).warning("metrics db refresh failed", exc_info=True)
-        return
+class DbStateCollector:
+    """Seat gauges computed from Postgres, not from in-process counters.
 
-    per_show: dict[str, dict[str, int]] = {}
-    for r in rows:
-        per_show.setdefault(str(r["show_id"]), {"available": 0, "held": 0, "confirmed": 0})[r["status"]] = r["n"]
-    SEATS.clear()
-    SEATS_AVAILABLE.clear()
-    for show_id, c in per_show.items():
-        for status, n in c.items():
-            SEATS.labels(show_id, status).set(n)
-        SEATS.labels(show_id, "total").set(sum(c.values()))
-        SEATS_AVAILABLE.labels(show_id).set(c["available"])
-    for check, n in violations.items():
-        INVARIANT_VIOLATIONS.labels(check).set(n)
-    DB_SCRAPE_OK.set(1)
+    The /metrics handler refreshes the snapshot right before rendering, so the
+    numbers are exactly what GET /shows/{id} would return -- and they are the
+    same no matter which worker process serves the scrape.
+    """
 
-    DB_POOL.labels("size").set(pool.get_size())
-    DB_POOL.labels("idle").set(pool.get_idle_size())
-    DB_POOL.labels("max").set(pool.get_max_size())
+    def __init__(self):
+        self.snapshot: tuple[dict, dict, dict, bool] = ({}, {}, {}, False)
+
+    async def refresh(self, pool, recent_shows: int, timeout_s: float) -> None:
+        try:
+            async with pool.acquire(timeout=timeout_s) as conn:
+                rows = await conn.fetch(
+                    """WITH recent AS (SELECT id, created_at FROM shows ORDER BY created_at DESC LIMIT $1)
+                       SELECT s.show_id, extract(epoch FROM r.created_at)::float8 AS created, s.status, count(*) AS n
+                         FROM seats s JOIN recent r ON r.id = s.show_id
+                        GROUP BY s.show_id, r.created_at, s.status""",
+                    recent_shows,
+                    timeout=timeout_s,
+                )
+                violations = await conn.fetchrow(
+                    """WITH recent AS (SELECT id FROM shows ORDER BY created_at DESC LIMIT $1)
+                       SELECT
+                         (SELECT count(*) FROM seats s JOIN recent ON recent.id = s.show_id
+                            LEFT JOIN reservations r ON r.id = s.reservation_id
+                           WHERE s.status <> 'available'
+                             AND (r.id IS NULL OR r.status <> s.status OR r.user_id <> s.user_id))
+                           AS seat_without_live_reservation,
+                         (SELECT count(*) FROM user_show_seats u JOIN recent ON recent.id = u.show_id
+                           WHERE u.seats_held <> (SELECT count(*) FROM seats s
+                                                   WHERE s.show_id = u.show_id AND s.user_id = u.user_id
+                                                     AND s.status <> 'available'))
+                           AS user_counter_drift,
+                         (SELECT count(*) FROM reservations r JOIN recent ON recent.id = r.show_id
+                           WHERE r.status = 'held' AND r.hold_expires_at < now() - interval '30 seconds')
+                           AS holds_overdue_for_expiry""",
+                    recent_shows,
+                    timeout=timeout_s,
+                )
+        except Exception:
+            logging.getLogger(__name__).warning("metrics db refresh failed", exc_info=True)
+            self.snapshot = ({}, {}, {}, False)
+            return
+        per_show: dict[str, dict[str, int]] = {}
+        created: dict[str, float] = {}
+        for r in rows:
+            sid = str(r["show_id"])
+            per_show.setdefault(sid, {"available": 0, "held": 0, "confirmed": 0})[r["status"]] = r["n"]
+            created[sid] = r["created"]
+        self.snapshot = (per_show, created, dict(violations), True)
+
+    def mark_unavailable(self) -> None:
+        self.snapshot = ({}, {}, {}, False)
+
+    def collect(self):
+        per_show, created, violations, ok = self.snapshot
+        seats = GaugeMetricFamily("seats", "Seats per status for recent shows (read from DB at scrape)",
+                                  labels=["show_id", "status"])
+        avail = GaugeMetricFamily("seats_available", "Available seats per recent show (read from DB at scrape)",
+                                  labels=["show_id"])
+        for show_id, c in per_show.items():
+            for status, n in c.items():
+                seats.add_metric([show_id, status], n)
+            seats.add_metric([show_id, "total"], sum(c.values()))
+            avail.add_metric([show_id], c["available"])
+        born = GaugeMetricFamily("show_created_timestamp_seconds", "Creation time of each tracked show",
+                                 labels=["show_id"])
+        for show_id, ts in created.items():
+            born.add_metric([show_id], ts)
+        inv = GaugeMetricFamily("seat_invariant_violations",
+                                "Cross-table consistency violations across recent shows (must be 0)", labels=["check"])
+        for check, n in violations.items():
+            inv.add_metric([check], n)
+        scrape = GaugeMetricFamily("seat_metrics_db_scrape_ok", "1 if the DB-backed gauges were refreshed on this scrape",
+                                   value=1 if ok else 0)
+        return [seats, avail, born, inv, scrape]
+
+
+DB_STATE = DbStateCollector()
+_MULTIPROC = bool(os.environ.get("PROMETHEUS_MULTIPROC_DIR"))
+if not _MULTIPROC:
+    REGISTRY.register(DB_STATE)
+
+
+def render_metrics() -> bytes:
+    """Process metrics are merged across uvicorn workers when running with
+    PROMETHEUS_MULTIPROC_DIR; DB-backed gauges come from this scrape's snapshot."""
+    if _MULTIPROC:
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        registry.register(DB_STATE)
+        return generate_latest(registry)
+    return generate_latest(REGISTRY)
 
 
 # --------------------------------------------------------------------------- logging
@@ -228,6 +267,11 @@ class ObservabilityMiddleware:
             status = status_holder["status"]
             HTTP_REQUESTS.labels(scope["method"], route, str(status)).inc()
             HTTP_LATENCY.labels(scope["method"], route).observe(elapsed)
+            pool = getattr(self.fastapi_app.state, "pool", None)
+            if pool is not None:
+                DB_POOL.labels("size").set(pool.get_size())
+                DB_POOL.labels("idle").set(pool.get_idle_size())
+                DB_POOL.labels("max").set(pool.get_max_size())
             level = logging.DEBUG if route in _QUIET_ROUTES and status < 500 else logging.INFO
             access_log.log(
                 level,

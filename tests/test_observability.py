@@ -118,3 +118,24 @@ async def test_unhandled_error_is_json_500_with_request_id(app, client, monkeypa
     assert r.status_code == 500
     assert r.json()["error"]["request_id"] == "rid-500"
     assert r.headers["x-request-id"] == "rid-500"
+
+
+async def test_db_outage_is_503_not_500(client, make_show, auth_for, monkeypatch, app):
+    show = await make_show()
+    h = await auth_for("outage")
+
+    class DownPool:
+        def acquire(self, *_a, **_k):
+            raise ConnectionRefusedError("db down")
+
+        def get_size(self):
+            return 0
+
+        get_idle_size = get_max_size = get_size
+
+    monkeypatch.setattr(app.state, "pool", DownPool())
+    r = await client.post(f"/shows/{show['id']}/reserve", json={"seats": ["A1"], "idempotency_key": key()}, headers=h)
+    assert r.status_code == 503
+    assert r.json()["error"]["code"] == "database_unavailable"
+    assert r.headers["retry-after"] == "2"
+    assert (await client.get("/readyz")).status_code == 503

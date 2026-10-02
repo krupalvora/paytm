@@ -1,0 +1,42 @@
+{
+	admin off
+	servers {
+		timeouts {
+			read_header 10s
+			idle 2m
+		}
+	}
+}
+
+{$SITE_ADDRESS} {
+	encode gzip
+
+	handle /grafana* {
+		reverse_proxy grafana:3000
+	}
+
+	handle /prometheus* {
+		reverse_proxy prometheus:9090
+	}
+
+	handle /logs* {
+		import /etc/caddy/auth.caddy
+		reverse_proxy dozzle:8080
+	}
+
+	handle {
+		reverse_proxy app:8000 {
+			# Admission control: at most N concurrent requests reach the app;
+			# the rest wait inside Caddy (cheap goroutines) instead of piling up
+			# as Python coroutines. Overload => higher latency, never 5xx/OOM.
+			transport http {
+				max_conns_per_host {$UPSTREAM_MAX_CONNS}
+				keepalive 2m
+				keepalive_idle_conns 512
+			}
+			# Ride out app restarts/deploys instead of returning 502.
+			lb_try_duration 30s
+			lb_try_interval 250ms
+		}
+	}
+}

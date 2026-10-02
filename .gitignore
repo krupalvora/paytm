@@ -10,3 +10,5 @@ htmlcov/
 .DS_Store
 .tokensave/
 burst-results/
+deploy/caddy/auth.caddy
+.env.prod

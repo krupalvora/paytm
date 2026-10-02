@@ -12,6 +12,7 @@ RUN pip install -r requirements.txt
 
 COPY app ./app
 COPY migrations ./migrations
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 RUN useradd --create-home --uid 10001 appuser
 USER appuser
@@ -19,6 +20,5 @@ USER appuser
 ENV PORT=8000
 EXPOSE 8000
 
-# Single async worker: all in-process metrics live in one place and the DB,
-# not the worker count, is the concurrency bottleneck. Scale with instances.
-CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --no-access-log"]
+# WEB_CONCURRENCY uvicorn workers (default 1); see scripts/entrypoint.sh.
+CMD ["/usr/local/bin/entrypoint.sh"]

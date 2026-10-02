@@ -3,7 +3,35 @@
 Assigned-seat reservation API built for correctness under on-sale stampedes:
 no double-sell, per-user limits, idempotent retries.
 
-Stack: Python 3.12 · FastAPI · asyncpg · PostgreSQL 16.
+Stack: Python 3.12 · FastAPI · asyncpg · PostgreSQL 16 · Caddy · Prometheus · Grafana.
+Design rationale: [WRITEUP.md](WRITEUP.md).
+
+## Live deployment
+
+| | URL |
+|---|---|
+| API | `https://<HOST>` *(fill in after deploy)* |
+| Health | `https://<HOST>/healthz`, `https://<HOST>/readyz` |
+| Metrics | `https://<HOST>/metrics` |
+| Dashboard | `https://<HOST>/grafana/` (anonymous, read-only) |
+| Alert rules | `https://<HOST>/prometheus/alerts` |
+| Live logs | `https://<HOST>/logs/` (basic auth, credentials shared separately) |
+
+```bash
+./burst.sh https://<HOST> --admin-token <ADMIN_TOKEN>
+```
+
+## Try it
+
+```bash
+BASE=http://localhost:8000; ADMIN=dev-admin-token
+SHOW=$(curl -s -X POST $BASE/shows -H "Authorization: Bearer $ADMIN" -H 'content-type: application/json' \
+  -d '{"name":"friday-night","seats":["A1","A2","A3","A12","A13"],"price_paise":25000}' | jq -r .id)
+TOKEN=$(curl -s -X POST $BASE/auth/token -H 'content-type: application/json' -d '{"user_id":"alice"}' | jq -r .access_token)
+curl -s -X POST $BASE/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'Idempotency-Key: k1' \
+  -H 'content-type: application/json' -d '{"seats":["A12"]}'
+curl -s $BASE/shows/$SHOW | jq .counts
+```
 
 ## Run locally
 
@@ -12,6 +40,39 @@ make up                      # app + postgres via docker compose
 curl localhost:8000/healthz  # liveness
 curl localhost:8000/readyz   # readiness (checks DB, 503 if down)
 ```
+
+## Deploy (single VM: DigitalOcean droplet / AWS EC2)
+
+Everything runs from [docker-compose.prod.yml](docker-compose.prod.yml) on one Ubuntu VM:
+
+```
+internet ─▶ Caddy :443 (auto-TLS, admission control: ≤256 concurrent upstream conns)
+              ├─▶ app  (uvicorn × WEB_CONCURRENCY workers) ─▶ Postgres 16 (volume)
+              ├─▶ /grafana/  ─▶ Grafana ─▶ Prometheus (scrapes app /metrics every 5s, alert rules)
+              └─▶ /logs/     ─▶ Dozzle (live docker logs, basic auth)
+```
+
+1. Create a VM: Ubuntu 22.04/24.04, **2+ vCPU / 2+ GB RAM** recommended (the burst is CPU-bound).
+   Open inbound **22, 80, 443** in the security group or cloud firewall.
+2. On the VM:
+   ```bash
+   git clone <this repo> seats && cd seats
+   sudo ./deploy/bootstrap.sh                    # HTTPS at https://<ip-with-dashes>.sslip.io, no domain needed
+   # or: sudo ./deploy/bootstrap.sh seats.example.com   (A record -> VM IP)
+   # or: sudo ./deploy/bootstrap.sh :80                 (plain HTTP on the IP)
+   ```
+   It installs Docker, tunes kernel network limits, generates `.env` with random secrets
+   (admin token, JWT secret, DB/Grafana/log passwords), starts the stack, waits for `/readyz`
+   and prints every URL and credential. Re-running is safe; secrets are kept.
+3. Later deploys: `git pull && docker compose -f docker-compose.prod.yml up -d --build`.
+
+**Cold start / reboot:** every service has `restart: unless-stopped`. If the app comes up
+before Postgres, it serves `/healthz` and keeps `/readyz` at 503 while migrations retry. It
+turns ready about 2s after the DB is reachable. While the app restarts, Caddy holds requests
+for up to 30s (`lb_try_duration`) instead of returning 502.
+
+**Tuning knobs** (`.env`): `WEB_CONCURRENCY` (workers; default = vCPUs, max 4), `DB_POOL_MAX`
+(per worker; workers × pool must stay under Postgres `max_connections`=200), `UPSTREAM_MAX_CONNS`.
 
 ## Tests
 
@@ -79,6 +140,9 @@ User identity comes only from the token's `sub`; a `user_id` in a request body i
 | 409 | `per_user_limit_exceeded` | would exceed the show's `per_user_limit` (held + confirmed) |
 | 409 | `idempotency_key_reused` | same key, different request (seats/show/hold) |
 | 422 | `unknown_seats`, `validation_error`, `idempotency_key_required` | bad request |
+| 503 | `database_unavailable` | Postgres unreachable (with `Retry-After`); `/readyz` is failing at the same time |
+
+Every domain decline is a 4xx. A 5xx means the infrastructure failed or there is a bug, and it pages.
 
 ### Holds and release
 
