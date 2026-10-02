@@ -18,6 +18,11 @@ async def readiness(request: Request) -> JSONResponse:
     # Readiness: fail closed if the DB is unreachable, so no traffic is routed
     # to an instance that can't make atomic decisions.
     settings = request.app.state.settings
+    if not request.app.state.migrated.is_set():
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "checks": {"database": "unknown", "migrations": "pending"}},
+        )
     try:
         await db.ping(request.app.state.pool, settings.readiness_timeout_s)
     except Exception as exc:  # any failure => not ready
@@ -25,4 +30,4 @@ async def readiness(request: Request) -> JSONResponse:
             status_code=503,
             content={"status": "unavailable", "checks": {"database": "down"}, "error": type(exc).__name__},
         )
-    return JSONResponse(content={"status": "ready", "checks": {"database": "ok"}})
+    return JSONResponse(content={"status": "ready", "checks": {"database": "ok", "migrations": "ok"}})

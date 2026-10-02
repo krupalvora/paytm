@@ -13,6 +13,13 @@ class Settings(BaseSettings):
     # Readiness probe must answer fast; a slow DB counts as not ready.
     readiness_timeout_s: float = 2.0
 
+    # Bearer token for admin endpoints (POST /shows). Override in every real deploy.
+    admin_token: str = "dev-admin-token"
+
+    default_per_user_limit: int = 4
+    default_hold_ttl_seconds: int = 300
+    max_seats_per_show: int = 20000
+
     log_level: str = "INFO"
     port: int = 8000
 
